@@ -1,0 +1,27 @@
+# general things to ignore
+.DS_Store
+build/
+dist/
+*.egg-info/
+*.egg
+*.py[cod]
+__pycache__/
+*.so
+.cache/
+*.log
+*~
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+include/config.h
+*.out
+
+# IDE
+.vscode/
+.python-version
+
+# WhisperLive-client
+chunks/
