@@ -25,3 +25,4 @@ include/config.h
 
 # WhisperLive-client
 chunks/
+*.wav
