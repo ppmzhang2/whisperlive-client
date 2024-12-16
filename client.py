@@ -5,7 +5,6 @@ import os
 import shutil
 import subprocess
 import threading
-import time
 import typing
 import uuid
 import wave
@@ -14,6 +13,155 @@ import loguru
 import numpy as np
 import pyaudio
 import websocket
+
+DTYPE_TXT = "U256"
+DTYPE_SRT = np.dtype({
+    "names": ("eos", "beg", "end", "txt"),
+    "formats": (np.int8, np.int32, np.int32, DTYPE_TXT),
+})
+
+
+def seg2arr(seg: dict) -> np.ndarray:
+    """Converts a segment into an numpy array of SRT dtype."""
+    return np.array(
+        (
+            int(seg.get("completed", False)),
+            int(float(seg["start"]) * 1000),
+            int(float(seg["end"]) * 1000),
+            seg["text"],
+        ),
+        dtype=DTYPE_SRT,
+    )
+
+
+def get_intvl_union(arr: np.ndarray) -> list[tuple[int, int]]:
+    """Compute the union of completed intervals.
+
+    Args:
+        arr (np.ndarray): A structured numpy array with the following fields:
+            - np.int32, start timestamp of the interval.
+            - np.int32, end timestamp of the interval.
+
+    Returns:
+        list[tuple[int, int]]: A list of disjoint intervals covering all
+            completed records.
+    """
+    # Compute the union of completed intervals
+    ret = []
+    beg_cur, end_cur = arr[0]
+
+    for beg_, end_ in arr[1:]:
+        # Overlapping or touching
+        if beg_ <= end_cur:
+            end_cur = max(end_cur, end_)
+        # Disjoint
+        else:
+            ret.append((beg_cur, end_cur))
+            beg_cur, end_cur = beg_, end_
+    ret.append((beg_cur, end_cur))
+    return ret
+
+
+def interp_minutes(arr: np.ndarray) -> np.ndarray:
+    """Interpolate transcript text for incomplete intervals.
+
+    Modify a structured numpy array of text intervals by filling gaps in the
+    union of completed intervals using incomplete intervals, based on overlap
+    and proportional matching.
+
+    Args:
+        arr (np.ndarray): A structured numpy array with the following fields:
+            - 'eos': np.int8, indicating whether the record is completed (1) or
+              incomplete (0).
+            - 'beg': np.int32, start timestamp of the interval.
+            - 'end': np.int32, end timestamp of the interval.
+            - 'txt': str, text associated with the interval.
+
+    Logic:
+    - Extract `completed` records (where `eos` == 1) and compute the union of
+      their intervals. The union is represented as a list of disjoint intervals
+      covering all completed records.
+    - Identify the gaps between these union intervals. A gap is defined as the
+      time span between the end of one union interval and the start of next.
+    - Match each gap with an appropriate `incomplete` record (where `eos` == 0)
+      using the following rules:
+      - If the incomplete record's interval exactly matches a gap or is a
+        subset of it, use the record's full text.
+      - If the incomplete record's interval partially overlaps a gap, calculate
+        the overlap ratio and fill the gap with a proportional segment of the
+        record's text.
+      - If an incomplete record does not overlap with any gap, discard it.
+    - Add trailing incomplete records that extend beyond the last completed
+    - Combine all completed records with the filled gaps, ensuring the final
+      output is sorted by the `beg` field.
+    """
+    # Return if no records
+    if arr.size == 0:
+        return arr
+
+    # Extract completed and incomplete records
+    arr_compl = arr[arr["eos"] == 1]
+    arr_incompl = arr[arr["eos"] == 0]
+
+    # Return all incomplete records if no completed records
+    if arr_compl.size == 0:
+        return arr_incompl
+
+    # Compute the union of completed intervals
+    intvl_union = get_intvl_union(arr_compl[["beg", "end"]])
+
+    # Compute gaps from the union intervals
+    gaps = []
+    for i in range(len(intvl_union) - 1):
+        gaps.append((intvl_union[i][1], intvl_union[i + 1][0]))
+
+    filled_gaps = []
+
+    # Handle trailing incomplete records beyond the last completed interval
+    end_compl_last = intvl_union[-1][1]
+    arr_incompl_latest = arr_incompl[arr_incompl["beg"] >= end_compl_last]
+
+    # Match each gap with incomplete records
+    for beg_gap, end_gap in gaps:
+        txt_best = "..."  # default text for the gap
+        r_best = 0  # best overlap ratio
+
+        for _, beg_incompl, end_incompl, txt_incompl in arr_incompl:
+            beg_overlap = max(beg_gap, beg_incompl)
+            end_overlap = min(end_gap, end_incompl)
+
+            # 1. Skip if no overlap
+            if beg_overlap >= end_overlap:
+                continue
+
+            # Calculate overlap ratio
+            len_overlap = end_overlap - beg_overlap
+            len_incompl = end_incompl - beg_incompl
+            r_overlap = len_overlap / len_incompl
+
+            # 2. Exact match or subset
+            if beg_incompl >= beg_gap and end_incompl <= end_gap:
+                txt_best = txt_incompl
+                break
+            # 3. Partial overlap, track best fit
+            if r_overlap > r_best:
+                r_best = r_overlap
+                # Get only the first (100 * r_best)% words, or even fewer
+                n_word = txt_incompl.count(" ")
+                txt_best = " ".join(txt_incompl.split()[:int(n_word * r_best)])
+
+        # Fill the gap with the best fit text
+        filled_gaps.append((0, beg_gap, end_gap, txt_best))
+
+    # Add trailing incomplete records
+    for _, beg_latest, end_latest, txt_latest in arr_incompl_latest:
+        filled_gaps.append((0, beg_latest, end_latest, txt_latest))
+
+    arr_filled = np.array(filled_gaps, dtype=DTYPE_SRT)
+
+    arr_ = np.concatenate((arr_compl, arr_filled), axis=0)
+    arr_.sort(order="beg")
+    return arr_
 
 
 def clear_screen() -> None:
@@ -43,6 +191,7 @@ class WsClient:
 
     INSTANCES: typing.ClassVar = {}
     END_OF_AUDIO = "END_OF_AUDIO"
+    BACKEND_VALID = "faster_whisper"
 
     def __init__(  # noqa: PLR0913
         self,
@@ -83,13 +232,10 @@ class WsClient:
         self.task = "transcribe"
         self.uid = str(uuid.uuid4())
         self.waiting = False
-        self.last_response_received = None
         self.language = lang
         self.model = model
         self.server_error = False
         self.use_vad = use_vad
-        self.last_segment = None
-        self.last_received_segment = None
         self.max_clients = max_clients
         self.max_connection_time = max_connection_time
 
@@ -117,8 +263,37 @@ class WsClient:
         self.ws_thread.daemon = True
         self.ws_thread.start()
 
-        self.transcript = []
+        self.minutes = {}
+        self.lines = np.empty(0, dtype=DTYPE_SRT)
         loguru.logger.info("WsClient initialized")
+
+    def update_minutes(self, segments: list[dict]) -> None:
+        """Updates the minutes dictionary with the latest segments."""
+        # filter out invalid segments
+        # - uncompleted segments that are not the last segment
+        # - invalid timestamps
+        arr_seg = np.array([seg2arr(seg) for seg in segments])
+        arr_seg = arr_seg[(arr_seg["eos"] == 1)
+                          | ((arr_seg["eos"] == 0) &
+                             (arr_seg["beg"] < arr_seg["end"]))]
+
+        for _, seg in enumerate(arr_seg):
+            self.minutes[seg["beg"]] = seg
+
+        arr = np.array(list(self.minutes.values()))
+        arr.sort(order=["beg", "eos"])
+        arr_interp = interp_minutes(arr)
+        self.lines = arr_interp
+
+    def print_minutes(self) -> None:
+        """Prints the transcript segments in the minutes dictionary."""
+        # Log transcript; truncate to last 3 entries for brevity.
+        # print_transcript()
+        if self.lines.size == 0:
+            return
+        clear_screen()
+        for _, _, _, txt in self.lines:
+            print(txt)
 
     def handle_status_msg(self, msg: dict) -> None:
         """Handles server status messages."""
@@ -132,30 +307,6 @@ class WsClient:
             self.server_error = True
         elif status == "WARNING":
             loguru.logger.warning(f"Warning from Server: {msg['message']}")
-
-    def process_segments(self, segments: list[dict]) -> None:
-        """Processes transcript segments."""
-        text = []
-        for i, seg in enumerate(segments):
-            if not text or text[-1] != seg["text"]:
-                text.append(seg["text"])
-                if i == len(segments) - 1 and not seg.get("completed", False):
-                    self.last_segment = seg
-                elif (self.server_backend == "faster_whisper"
-                      and seg.get("completed", False)
-                      and (not self.transcript or float(seg["start"]) >= float(
-                          self.transcript[-1]["end"]))):
-                    self.transcript.append(seg)
-        # update last received segment and last valid response time
-        if (self.last_received_segment is None
-                or self.last_received_segment != segments[-1]["text"]):
-            self.last_response_received = time.time()
-            self.last_received_segment = segments[-1]["text"]
-
-        # Log transcript; truncate to last 3 entries for brevity.
-        text = text[-3:]
-        clear_screen()
-        print_transcript(text)
 
     def on_message(self, ws: websocket.WebSocket, msg: str) -> None:
         """Callback function called when a message is received from the server.
@@ -184,9 +335,12 @@ class WsClient:
             self.recording = False
 
         if "message" in dict_msg and dict_msg["message"] == "SERVER_READY":
-            self.last_response_received = time.time()
             self.recording = True
             self.server_backend = dict_msg["backend"]
+            if self.server_backend != self.BACKEND_VALID:
+                loguru.logger.error(
+                    f"Server backend {self.server_backend} not supported.")
+                raise ValueError()
             loguru.logger.info(f"Server Running backend {self.server_backend}")
             return
 
@@ -198,7 +352,8 @@ class WsClient:
             return
 
         if "segments" in dict_msg:
-            self.process_segments(dict_msg["segments"])
+            self.update_minutes(dict_msg["segments"])
+            self.print_minutes()
 
     def on_error(self, ws: websocket.WebSocket, error: Exception) -> None:
         """Callback when an error occurs in the WebSocket."""
@@ -526,19 +681,20 @@ class AudioClient:
 
 
 if __name__ == "__main__":
+    model = "small"
     ws_client = WsClient(
         "localhost",
         9090,
         lang="en",
         translate=False,
-        model="large-v3",
-        use_vad=False,
+        model=model,
+        use_vad=True,
         max_clients=4,
         max_connection_time=600,
     )
     audio_client = AudioClient(
         [ws_client],
-        save_recording=True,
+        save_recording=False,
         out_recording="./output_recording.wav",
     )
     audio_client()
