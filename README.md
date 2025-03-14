@@ -10,7 +10,8 @@ A lightweight client for real-time transcription and translation with the `Whisp
 
 ## Setup
 
-1. Install Python 3.8+ and dependencies either
+1. Install Python 3.8+ and dependencies either.
+   Make sure `portaudio` is installed on your system.
 
    - via `pip`:
 
