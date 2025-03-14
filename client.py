@@ -20,6 +20,8 @@ DTYPE_SRT = np.dtype({
     "formats": (np.int8, np.int32, np.int32, DTYPE_TXT),
 })
 
+logger = loguru.logger
+
 
 def seg2arr(seg: dict) -> np.ndarray:
     """Converts a segment into an numpy array of SRT dtype."""
@@ -183,7 +185,7 @@ def clear_screen() -> None:
 
 def print_transcript(text: list[str]) -> None:
     """Prints formatted transcript text."""
-    print("\n".join(text))
+    logger.info("\n".join(text))
 
 
 class WsClient:
@@ -249,10 +251,10 @@ class WsClient:
         self.client_socket = websocket.WebSocketApp(
             socket_url,
             on_open=lambda ws: self.on_open(ws),
-            on_message=lambda ws, message: self.on_message(ws, message),
-            on_error=lambda ws, error: self.on_error(ws, error),
-            on_close=lambda ws, close_status_code, close_msg: self.on_close(
-                ws, close_status_code, close_msg),
+            on_message=lambda _, message: self.on_message(message),
+            on_error=lambda _, error: self.on_error(error),
+            on_close=lambda _, close_status_code, close_msg: self.on_close(
+                close_status_code, close_msg),
         )
 
         WsClient.INSTANCES[self.uid] = self
@@ -293,7 +295,7 @@ class WsClient:
             return
         clear_screen()
         for _, _, _, txt in self.lines:
-            print(txt)
+            loguru.logger.info(txt)
 
     def handle_status_msg(self, msg: dict) -> None:
         """Handles server status messages."""
@@ -308,7 +310,7 @@ class WsClient:
         elif status == "WARNING":
             loguru.logger.warning(f"Warning from Server: {msg['message']}")
 
-    def on_message(self, ws: websocket.WebSocket, msg: str) -> None:
+    def on_message(self, msg: str) -> None:
         """Callback function called when a message is received from the server.
 
         It updates various attributes of the client based on the received
@@ -317,7 +319,6 @@ class WsClient:
         status to False.
 
         Args:
-            ws (websocket.WebSocket): The WebSocket client instance.
             msg (str): The received message from the server.
         """
         dict_msg = json.loads(msg)
@@ -355,7 +356,7 @@ class WsClient:
             self.update_minutes(dict_msg["segments"])
             self.print_minutes()
 
-    def on_error(self, ws: websocket.WebSocket, error: Exception) -> None:
+    def on_error(self, error: Exception) -> None:
         """Callback when an error occurs in the WebSocket."""
         loguru.logger.error(f"WS Error: {error}")
         self.server_error = True
@@ -363,7 +364,6 @@ class WsClient:
 
     def on_close(
         self,
-        ws: websocket.WebSocket,
         close_status_code: int | None,
         close_msg: str | None,
     ) -> None:
@@ -401,8 +401,8 @@ class WsClient:
         """
         try:
             self.client_socket.send(data, websocket.ABNF.OPCODE_BINARY)
-        except Exception as e:
-            loguru.logger.error(f"Error sending packet to server: {e}")
+        except Exception:
+            logger.exception("Error sending packet to server")
 
     def close_websocket(self) -> None:
         """Close the WebSocket connection and join the WebSocket thread.
@@ -413,13 +413,13 @@ class WsClient:
         """
         try:
             self.client_socket.close()
-        except Exception as e:
-            loguru.logger.error("Error closing WS:", e)
+        except Exception:
+            logger.exception("Error closing WS")
 
         try:
             self.ws_thread.join()
-        except Exception as e:
-            loguru.logger.error("Error joining WS thread:", e)
+        except Exception:
+            logger.exception("Error joining WS thread")
 
 
 class AudioClient:
@@ -681,7 +681,7 @@ class AudioClient:
 
 
 if __name__ == "__main__":
-    model = "small"
+    model = "small.en"
     ws_client = WsClient(
         "localhost",
         9090,

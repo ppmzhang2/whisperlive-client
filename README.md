@@ -10,7 +10,9 @@ A lightweight client for real-time transcription and translation with the `Whisp
 
 ## Setup
 
-1. Install Python 3.8+ and dependencies either
+1. Install Python 3.8+ and dependencies.
+   Make sure `portaudio` or its development package e.g. `portaudio19-dev` is
+   installed.
 
    - via `pip`:
 
@@ -21,7 +23,7 @@ A lightweight client for real-time transcription and translation with the `Whisp
    - or via `conda`:
 
    ```bash
-   conda env create -f conda-whislive-client-py311.yaml
+   conda env create -f py311-wslclient.yaml
    ```
 
 2. Start the `WhisperLive` server.
