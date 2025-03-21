@@ -1,9 +1,12 @@
 """WhisperLive Client for real-time audio transcription and translation."""
 
+import argparse
 import json
 import os
+import select
 import shutil
 import subprocess
+import sys
 import threading
 import typing
 import uuid
@@ -14,13 +17,47 @@ import numpy as np
 import pyaudio
 import websocket
 
+logger = loguru.logger
+
 DTYPE_TXT = "U256"
 DTYPE_SRT = np.dtype({
     "names": ("eos", "beg", "end", "txt"),
     "formats": (np.int8, np.int32, np.int32, DTYPE_TXT),
 })
 
-logger = loguru.logger
+# add a custom log level
+logger.remove()
+logger.level("TRANSCRIPT", no=25, color="<yellow>")
+# Transcript-only: no prefix, just message
+logger.add(
+    sys.stdout,
+    level="TRANSCRIPT",
+    colorize=True,
+    format="{message}",
+    filter=lambda record: record["level"].name == "TRANSCRIPT",
+)
+logger.add(
+    sys.stdout,
+    level="INFO",
+    colorize=True,
+    filter=lambda record: record["level"].name != "TRANSCRIPT",
+)
+logger.add(
+    sys.stderr,
+    level="WARNING",
+    colorize=True,
+    filter=lambda record: record["level"].name != "TRANSCRIPT",
+    backtrace=True,
+    diagnose=True,
+)
+logger.add(
+    sys.stderr,
+    level="ERROR",
+    colorize=True,
+    filter=lambda record: record["level"].name != "TRANSCRIPT",
+    backtrace=True,
+    diagnose=True,
+)
 
 
 def seg2arr(seg: dict) -> np.ndarray:
@@ -173,13 +210,13 @@ def clear_screen() -> None:
 
     # Validate if the command exists
     if shutil.which(cmd_txt) is None:
-        loguru.logger.error(f"Command '{cmd_txt}' not found.")
+        logger.error(f"Command '{cmd_txt}' not found.")
         raise FileNotFoundError()
 
     try:
         subprocess.run([cmd_txt], check=True, text=True)  # noqa: S603
-    except subprocess.CalledProcessError as e:
-        loguru.logger.error(f"Failed to execute '{cmd_txt}': {e}")
+    except subprocess.CalledProcessError:
+        logger.exception(f"Failed to execute '{cmd_txt}'")
         raise
 
 
@@ -267,7 +304,7 @@ class WsClient:
 
         self.minutes = {}
         self.lines = np.empty(0, dtype=DTYPE_SRT)
-        loguru.logger.info("WsClient initialized")
+        logger.info("WsClient initialized")
 
     def update_minutes(self, segments: list[dict]) -> None:
         """Updates the minutes dictionary with the latest segments."""
@@ -295,20 +332,33 @@ class WsClient:
             return
         clear_screen()
         for _, _, _, txt in self.lines:
-            loguru.logger.info(txt)
+            logger.log("TRANSCRIPT", txt)
 
     def handle_status_msg(self, msg: dict) -> None:
         """Handles server status messages."""
         status = msg["status"]
         if status == "WAIT":
             self.waiting = True
-            loguru.logger.info("Server is full. Estimated wait time "
-                               f"{round(msg['message'])} minutes.")
+            logger.info("Server is full. Estimated wait time "
+                        f"{round(msg['message'])} minutes.")
         elif status == "ERROR":
-            loguru.logger.error(f"Error from Server: {msg['message']}")
+            logger.error(f"Error from Server: {msg['message']}")
             self.server_error = True
         elif status == "WARNING":
-            loguru.logger.warning(f"Warning from Server: {msg['message']}")
+            logger.warning(f"Warning from Server: {msg['message']}")
+
+    def latest_minutes(self, n: int = 10) -> str:
+        """Get the latest n segments of the transcript.
+
+        Args:
+            n (int, optional): The number of segments to return. Default is 10.
+
+        Returns:
+            str: The latest transcript of the last n segments.
+        """
+        if self.lines.size == 0:
+            return ""
+        return "".join(self.lines["txt"][-n:])
 
     def on_message(self, msg: str) -> None:
         """Callback function called when a message is received from the server.
@@ -324,7 +374,7 @@ class WsClient:
         dict_msg = json.loads(msg)
 
         if self.uid != dict_msg.get("uid"):
-            loguru.logger.error("invalid client uid")
+            logger.error("invalid client uid")
             return
 
         if "status" in dict_msg:
@@ -332,24 +382,24 @@ class WsClient:
             return
 
         if "message" in dict_msg and dict_msg["message"] == "DISCONNECT":
-            loguru.logger.info("Server disconnected due to overtime.")
+            logger.info("Server disconnected due to overtime.")
             self.recording = False
 
         if "message" in dict_msg and dict_msg["message"] == "SERVER_READY":
             self.recording = True
             self.server_backend = dict_msg["backend"]
             if self.server_backend != self.BACKEND_VALID:
-                loguru.logger.error(
+                logger.error(
                     f"Server backend {self.server_backend} not supported.")
                 raise ValueError()
-            loguru.logger.info(f"Server Running backend {self.server_backend}")
+            logger.info(f"Server Running backend {self.server_backend}")
             return
 
         if "language" in dict_msg:
             self.language = dict_msg.get("language")
             lang_prob = dict_msg.get("language_prob")
-            loguru.logger.info("Server detected language "
-                               f"{self.language} with probability {lang_prob}")
+            logger.info("Server detected language "
+                        f"{self.language} with probability {lang_prob}")
             return
 
         if "segments" in dict_msg:
@@ -358,7 +408,7 @@ class WsClient:
 
     def on_error(self, error: Exception) -> None:
         """Callback when an error occurs in the WebSocket."""
-        loguru.logger.error(f"WS Error: {error}")
+        logger.error(f"WS Error: {error}")
         self.server_error = True
         self.error_message = error
 
@@ -368,7 +418,7 @@ class WsClient:
         close_msg: str | None,
     ) -> None:
         """Callback when the WebSocket connection is closed."""
-        loguru.logger.info(f"WS closed: {close_status_code}: {close_msg}")
+        logger.info(f"WS closed: {close_status_code}: {close_msg}")
         self.recording = False
         self.waiting = False
 
@@ -381,7 +431,7 @@ class WsClient:
         Args:
             ws (websocket.WebSocketApp): The WebSocket client instance.
         """
-        loguru.logger.info("Opened connection")
+        logger.info("Opened connection")
         ws.send(
             json.dumps({
                 "uid": self.uid,
@@ -452,7 +502,7 @@ class AudioClient:
     ):
         self.clients = clients
         if not self.clients:
-            loguru.logger.error("At least one client is required.")
+            logger.error("At least one client is required.")
             raise ValueError()
         self.chunk = 4096
         self.format = pyaudio.paInt16
@@ -497,14 +547,14 @@ class AudioClient:
             audio (str, optional): Path to an audio file for transcription.
             Default is None, which triggers live recording.
         """
-        loguru.logger.info("Waiting for server ready ...")
+        logger.info("Waiting for server ready ...")
         for client in self.clients:
             while not client.recording:
                 if client.waiting or client.server_error:
                     self.close_clients()
                     return
 
-        loguru.logger.info("Server Ready!")
+        logger.info("Server Ready!")
         self.record()
 
     def close_clients(self) -> None:
@@ -680,16 +730,60 @@ class AudioClient:
         return raw_data.astype(np.float32) / 32768.0
 
 
+def wait_for_enter(callback: typing.Callable[[], None]) -> None:
+    """Keyboard listener that waits for the Enter key to be pressed."""
+    while True:
+        if select.select([sys.stdin], [], [], 0.1)[0]:
+            line = sys.stdin.readline().strip()
+            if line == "":
+                callback()
+
+
+def create_pipe(pipe_path: str) -> None:
+    """Create a named pipe for sending the transcript."""
+    if os.path.exists(pipe_path):
+        logger.error(f"Pipe {pipe_path} already exists.")
+        raise FileExistsError()
+    os.mkfifo(pipe_path)
+
+
+def remove_pipe(pipe_path: str) -> None:
+    """Remove the named pipe."""
+    if os.path.exists(pipe_path):
+        os.remove(pipe_path)
+
+
+def send_pipe(ws_client: WsClient, pipe_path: str) -> None:
+    """Send the latest transcript to a named pipe."""
+    transcript = ws_client.latest_minutes()
+    if not transcript.strip():
+        logger.warning("🟡 No speech to send.")
+        return
+
+    try:
+        with open(pipe_path, "w") as pipe:
+            pipe.write(transcript + "\n")
+            pipe.flush()
+        logger.info("📤 Transcript written to pipe.")
+    except BrokenPipeError:
+        logger.warning("⚠️ Broken pipe.")
+
+
 if __name__ == "__main__":
-    model = "small.en"
+    parser = argparse.ArgumentParser(
+        description="WhisperLive Client for real-time audio transcription.")
+    parser.add_argument("--model", type=str, default="small.en")
+    parser.add_argument("--pipepath", type=str, default="")
+    args = parser.parse_args()
+
     ws_client = WsClient(
         "localhost",
         9090,
         lang="en",
         translate=False,
-        model=model,
+        model=args.model,
         use_vad=True,
-        max_clients=4,
+        max_clients=2,
         max_connection_time=600,
     )
     audio_client = AudioClient(
@@ -697,4 +791,14 @@ if __name__ == "__main__":
         save_recording=False,
         out_recording="./output_recording.wav",
     )
+    if args.pipepath:
+        create_pipe(args.pipepath)
+        # Start assistant listener
+        threading.Thread(
+            target=wait_for_enter,
+            args=(lambda: send_pipe(ws_client, args.pipepath), ),
+            daemon=True,
+        ).start()
     audio_client()
+    if args.pipepath:
+        remove_pipe(args.pipepath)
