@@ -772,13 +772,15 @@ def send_pipe(ws_client: WsClient, pipe_path: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="WhisperLive Client for real-time audio transcription.")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=9090)
     parser.add_argument("--model", type=str, default="small.en")
     parser.add_argument("--pipepath", type=str, default="")
     args = parser.parse_args()
 
     ws_client = WsClient(
-        "localhost",
-        9090,
+        host=args.host,
+        port=args.port,
         lang="en",
         translate=False,
         model=args.model,
