@@ -41,8 +41,6 @@ ignore = [
     "D213",
     "S101",  # assert-used
     "INP001",  # implicit-namespace-package
-    "ANN101",  # missing-type-self
-    "ANN102",  # missing-type-cls
     "ANN204",  # missing-return-type-special-method
     "ERA001",  # commented-out-code
     "ANN002",  # missing-type-args
