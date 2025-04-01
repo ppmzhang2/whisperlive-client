@@ -11,6 +11,8 @@ import threading
 import typing
 import uuid
 import wave
+from datetime import UTC
+from datetime import datetime
 
 import loguru
 import numpy as np
@@ -304,6 +306,10 @@ class WsClient:
 
         self.minutes = {}
         self.lines = np.empty(0, dtype=DTYPE_SRT)
+
+        self.persist_dir = os.path.join("transcripts", self.uid)
+        os.makedirs(self.persist_dir, exist_ok=True)
+
         logger.info("WsClient initialized")
 
     def update_minutes(self, segments: list[dict]) -> None:
@@ -322,7 +328,20 @@ class WsClient:
         arr = np.array(list(self.minutes.values()))
         arr.sort(order=["beg", "eos"])
         arr_interp = interp_minutes(arr)
-        self.lines = arr_interp
+
+        # Persist old lines and truncate to last 20 lines
+        n_line = arr_interp.size
+        n_limit = 20
+        if self.lines.size <= n_limit:
+            self.lines = arr_interp
+            return
+        # Split into old and recent
+        old_lines = arr_interp[:n_line - n_limit]
+        self.lines = arr_interp[-n_limit:]
+        ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join(self.persist_dir, f"lines_{ts}.npy")
+        np.save(filename, old_lines)
+        self.minutes = {seg["beg"]: seg for seg in self.lines}
 
     def print_minutes(self) -> None:
         """Prints the transcript segments in the minutes dictionary."""
@@ -457,10 +476,20 @@ class WsClient:
     def close_websocket(self) -> None:
         """Close the WebSocket connection and join the WebSocket thread.
 
-        First attempts to close the WebSocket connection using
-        `self.client_socket.close()`. After closing the connection, it joins
-        the WebSocket thread to ensure proper termination.
+        - First, try to save `self.lines` to a file in the `self.persist_dir`.
+        - Try to close the WebSocket connection using
+          `self.client_socket.close()`.
+        - After closing the connection, it joins the WebSocket thread to ensure
+          proper termination.
         """
+        try:
+            np.save(
+                os.path.join(self.persist_dir, "lines_latest.npy"),
+                self.lines,
+            )
+        except Exception:
+            logger.exception("Error saving latest lines")
+
         try:
             self.client_socket.close()
         except Exception:
@@ -786,7 +815,7 @@ if __name__ == "__main__":
         model=args.model,
         use_vad=True,
         max_clients=2,
-        max_connection_time=600,
+        max_connection_time=3600,
     )
     audio_client = AudioClient(
         [ws_client],
